@@ -1117,15 +1117,17 @@ action_pause() {
 # Steps: drop byte 0x01; colours are marked by replacing ESC with 0x01; drop
 # all the remaining control characters; drop the C1 controls; 0x01 becomes
 # ESC again.
-# C1 controls (0x80-0x9F, e.g. 0x9B = CSI). On a UTF-8 terminal they are
-# removed in their encoded form (0xC2 0x80-0x9F), in their overlong encodings
-# (lead bytes 0xC0/0xC1, 0xE0 0x80-0x9F, 0xF0 0x80-0x8F: never valid UTF-8)
-# and as stray continuation bytes, i.e. runs of 0x80-0xBF that follow an ASCII
-# byte or start the line. These rules run in a loop (':a' ... 'ta') until
-# nothing changes: a single pass could be bypassed, because removing one
-# sequence can join the bytes around it into a new one (0xC2 0xC2 0x9B 0x9B).
-# Every pass shortens the line, so the loop ends. On any other terminal every
-# byte in 0x80-0x9F is a control and is removed.
+# C1 controls (0x80-0x9F, e.g. 0x9B = CSI). On a UTF-8 terminal the filter
+# targets their encoded form (0xC2 0x80-0x9F), their overlong encodings (lead
+# bytes 0xC0/0xC1, 0xE0 0x80-0x9F, 0xF0 0x80-0x8F: never valid UTF-8) and stray
+# continuation bytes, i.e. runs of 0x80-0xBF that follow an ASCII byte or start
+# the line. Each of them is REPLACED with '?', not deleted: deleting could join
+# the bytes around it into a new sequence (0xC2 0xC2 0x9B 0x9B), which would
+# need repeated passes, and repeated passes take quadratic time on a long
+# crafted line (CWE-407). With a replacement one pass is complete and linear.
+# The plain control characters are deleted BEFORE these rules, so the bytes
+# they leave adjacent are still caught. On any other terminal every byte in
+# 0x80-0x9F is a control and is removed.
 # sed must write line by line: -u with GNU sed, -l with the BSD/macOS one.
 SED_UNBUF=""
 log_filter() {
@@ -1136,14 +1138,12 @@ log_filter() {
       -e $'s/\001//g' \
       -e $'s/\033\\(\\[[0-9;]*m\\)/\001\\1/g' \
       -e $'s/[\002-\010\013-\037\177]//g' \
-      -e ':a' \
-      -e $'s/\302[\200-\237]//g' \
-      -e $'s/[\300\301][\200-\277]*//g' \
-      -e $'s/\340[\200-\237][\200-\277]\\{0,1\\}//g' \
-      -e $'s/\360[\200-\217][\200-\277]\\{0,2\\}//g' \
-      -e $'s/^[\200-\277]\\{1,\\}//' \
-      -e $'s/\\([\001-\177]\\)[\200-\277]\\{1,\\}/\\1/g' \
-      -e 'ta' \
+      -e $'s/\302[\200-\237]/?/g' \
+      -e $'s/[\300\301][\200-\277]*/?/g' \
+      -e $'s/\340[\200-\237][\200-\277]\\{0,1\\}/?/g' \
+      -e $'s/\360[\200-\217][\200-\277]\\{0,2\\}/?/g' \
+      -e $'s/^[\200-\277]\\{1,\\}/?/' \
+      -e $'s/\\([\001-\177]\\)[\200-\277]\\{1,\\}/\\1?/g' \
       -e $'s/\001/\033/g'
   else
     LC_ALL=C sed $SED_UNBUF \
@@ -1202,9 +1202,10 @@ action_logs() {
     fi
   done
 
-  # Once the engine is closed, the filter sees the end of the FIFO and exits
-  # by itself: waiting for it keeps it from writing after the monitor is redrawn.
-  kill "$LOG_PID" 2>/dev/null
+  # Both processes are stopped and reaped before going back: nothing can
+  # write to the screen after the monitor is redrawn, and leaving never has
+  # to wait for the filter to finish what it still has queued.
+  kill "$LOG_PID" "$LOG_FILTER_PID" 2>/dev/null
   wait "$LOG_PID" 2>/dev/null
   wait "$LOG_FILTER_PID" 2>/dev/null
   LOG_PID=""; LOG_FILTER_PID=""
