@@ -151,8 +151,9 @@ The first five are always shown; the others appear as the terminal gets wider.
   for the same reason.
 - **Inspect** shows the container's configuration, including its environment
   variables, which may contain secrets. Nothing is written to disk.
-- **Temporary files.** The monitor keeps a small snapshot file (mode 0600) in
-  `$XDG_RUNTIME_DIR` or `$TMPDIR` and removes it on exit.
+- **Temporary files.** The monitor keeps a small snapshot file in a private
+  directory (mode 0700, created with `mktemp -d`) under `$XDG_RUNTIME_DIR` or
+  `$TMPDIR`, and removes it on exit.
 - **bash 3.2.** The screen is refreshed once per second instead of ten times
   per second, and the filter accepts ASCII characters only.
 
