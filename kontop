@@ -237,8 +237,8 @@ read_seq() {
   fi
 }
 
-# Status-line message. Control characters are removed: the text may include
-# an engine error message, which must not be able to alter the terminal (CWE-150).
+# Status-line message. Control characters are removed as a last line of
+# defence; engine error text is already reduced to ASCII by engine_action.
 set_msg() { MSG=${1//[[:cntrl:]]/}; epoch MSG_TS; }
 
 # ---------------- TERMINAL ----------------
@@ -426,6 +426,10 @@ emit_snapshot() {
       ps_out=""
     fi
   fi
+
+  # Nothing coming from the engine may carry control characters to the screen
+  # (CWE-150): they are removed here, once, for every field of the list.
+  ps_out=$(printf '%s' "$ps_out" | LC_ALL=C tr -d '\000-\010\013-\037\177')
 
   # Metrics are looked up by ID in the 'stats' text (lines "id<TAB>cpu<TAB>..."),
   # delimited by newlines: a single expansion per container, no maps.
@@ -1003,6 +1007,9 @@ engine_action() {
     set_msg "${what}: ok"
   else
     err=${err##*"$NL"}                       # last line of the error
+    # Engine text is reduced to printable ASCII before it reaches the status
+    # line, byte by byte and regardless of the locale (CWE-150).
+    err=$(printf '%s' "$err" | LC_ALL=C tr -cd '\040-\176')
     set_msg "${what}: FAILED — ${err:-unknown error}"
   fi
   refresh_now
@@ -1111,10 +1118,14 @@ action_pause() {
 # all the remaining control characters; drop the C1 controls; 0x01 becomes
 # ESC again.
 # C1 controls (0x80-0x9F, e.g. 0x9B = CSI). On a UTF-8 terminal they are
-# removed in their encoded form (0xC2 0x80-0x9F) and as stray continuation
-# bytes, i.e. runs of 0x80-0xBF that follow an ASCII byte or start the line:
-# those are malformed UTF-8, never part of a character. On any other terminal
-# every byte in 0x80-0x9F is a control and is removed.
+# removed in their encoded form (0xC2 0x80-0x9F), in their overlong encodings
+# (lead bytes 0xC0/0xC1, 0xE0 0x80-0x9F, 0xF0 0x80-0x8F: never valid UTF-8)
+# and as stray continuation bytes, i.e. runs of 0x80-0xBF that follow an ASCII
+# byte or start the line. These rules run in a loop (':a' ... 'ta') until
+# nothing changes: a single pass could be bypassed, because removing one
+# sequence can join the bytes around it into a new one (0xC2 0xC2 0x9B 0x9B).
+# Every pass shortens the line, so the loop ends. On any other terminal every
+# byte in 0x80-0x9F is a control and is removed.
 # sed must write line by line: -u with GNU sed, -l with the BSD/macOS one.
 SED_UNBUF=""
 log_filter() {
@@ -1125,9 +1136,14 @@ log_filter() {
       -e $'s/\001//g' \
       -e $'s/\033\\(\\[[0-9;]*m\\)/\001\\1/g' \
       -e $'s/[\002-\010\013-\037\177]//g' \
+      -e ':a' \
       -e $'s/\302[\200-\237]//g' \
+      -e $'s/[\300\301][\200-\277]*//g' \
+      -e $'s/\340[\200-\237][\200-\277]\\{0,1\\}//g' \
+      -e $'s/\360[\200-\217][\200-\277]\\{0,2\\}//g' \
       -e $'s/^[\200-\277]\\{1,\\}//' \
       -e $'s/\\([\001-\177]\\)[\200-\277]\\{1,\\}/\\1/g' \
+      -e 'ta' \
       -e $'s/\001/\033/g'
   else
     LC_ALL=C sed $SED_UNBUF \
