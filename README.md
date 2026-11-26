@@ -4,20 +4,7 @@ An interactive, htop-style monitor for your containers, written as a single
 bash script. It works with **docker** and **podman**, on Linux and macOS, and
 runs on the stock macOS bash (3.2) with no extra packages.
 
-```
-CPU [||||||                                                          4.1%]
-MEM [||||||||||||||||||||                                           31.6%]
- docker   Containers: 5/9   Sort: NAME ▲   Cores: 8   [active only]   [groups]
- NAME▲               STATE      HEALTH       CPU%    MEM% PORTS           UPTIME
- ▾ shop  (4/4 active)
-   shop-api          running    healthy     2.31%   6.20% 8080                2h
-   shop-db           running    healthy     0.84%  12.75% 127.0.0.1:5432      2h
-   shop-cache        running    -           0.40%   0.31% 6379                2h
-   shop-web          running    -           0.02%   1.10% 443,8081→80         2h
- ▾ (no project)  (1/1 active)
-   mailhog           running    -           0.00%   0.13% 1025,8025           5d
-? Help  q Quit  / Filter  l Log  s Shell  S Start/Stop  r Restart  x Kill
-```
+![kontop showing containers grouped by compose project](docs/screenshot.png)
 
 ## Why another container monitor?
 
