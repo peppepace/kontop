@@ -1,0 +1,1370 @@
+#!/usr/bin/env bash
+#
+# kontop — interactive container monitor, htop style, for docker and podman.
+#
+# Copyright (c) 2026 Giuseppe Pace — MIT License (see LICENSE).
+# Written with the assistance of Claude (Anthropic).
+#
+# Engine: docker if available, otherwise podman. Force it with the
+#         CONTAINER_ENGINE variable (e.g. CONTAINER_ENGINE=podman kontop).
+#         When the script is launched through a name starting with 'p' (for
+#         example a symbolic link called ptop) podman is preferred instead.
+#         With rootless podman only the current user's containers are visible:
+#         run the script with sudo to see root's containers.
+#
+# Dependencies: bash >= 3.2 (the macOS system bash is fine), podman or docker,
+#               tput (ncurses), awk, sed, sort, cut, mkfifo.
+#               Optional: less (scrollable logs and inspect).
+#
+# Keys:
+#   ↑/↓ or k/j  navigation         g / G    top / bottom of the list
+#   PgUp/PgDn   page               ? or h   help
+#   c / m / n   sort by CPU / MEM / name (press the same key again to reverse)
+#   /           filter by name or project (Enter applies, ESC cancels/clears)
+#   a           show / hide stopped containers
+#   t           group by compose project
+#   l           live logs (q or ESC to go back)
+#   L           logs in less, to scroll and search (q to go back)
+#   s           shell in the container     i   inspect
+#   S           start / stop (confirm)     p   pause / unpause (confirm)
+#   r           restart (confirm)          x   kill (confirm)
+#   d           remove container (confirm; forced if active)
+#   q           quit
+# At startup the list is grouped by compose project, shows only the active
+# containers and is sorted alphabetically by name. Keys t and a toggle the first
+# two settings; the initial sort key is set with the KONTOP_SORT variable:
+# name | cpu | mem.
+#
+# Groups (key t): containers are gathered by compose project (label
+# com.docker.compose.project). On a group row S starts/stops and r restarts all
+# the containers of the project; the commands go straight to the engine, so the
+# depends_on order is NOT honoured.
+#
+# Columns: NAME STATE HEALTH CPU% MEM% PORTS UPTIME MEM-USAGE PIDS IMAGE NET-I/O BLOCK-I/O.
+# PORTS lists only the ports published on the host: '8443' (same port in the
+# container), '8080→80' (different port), '127.0.0.1:8025' (only on that address).
+# IMAGE is the last component of the image name (no registry, no digest).
+# The wider columns appear only if the terminal is wide enough.
+# Stopped containers (exited/created/...) appear with key a, with '-' in the
+# metrics; while they are hidden, a fully stopped project is not listed.
+
+# Compatible with bash 3.2 (the macOS system version): no associative arrays,
+# mapfile, ${var,,} or printf '%(...)T'. At least 3.2 is needed for printf -v,
+# += and [[ =~ ]].
+if (( BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
+  printf '%s\n' "Error: bash >= 3.2 is required (found ${BASH_VERSION})." >&2
+  exit 1
+fi
+
+# Numbers (engine percentages, sort keys, totals) always use a decimal point.
+# With a decimal-comma locale (it_IT, de_DE...) printf '%f', 'sort -n' and awk
+# would read or write them differently, so LC_NUMERIC is pinned to C for the
+# script and for the commands it runs. LC_ALL would take precedence: if it is
+# set, its value is moved to LANG and LC_CTYPE (characters and accents remain
+# the user's own).
+# NB: this must be a real assignment; in bash 3.2 the prefix form
+# 'LC_NUMERIC=C printf ...' has no effect on the builtin.
+if [[ -n "${LC_ALL:-}" ]]; then
+  LANG=$LC_ALL; LC_CTYPE=$LC_ALL
+  unset LC_ALL
+  export LANG LC_CTYPE
+fi
+LC_NUMERIC=C
+export LC_NUMERIC
+
+# Fractional 'read' timeouts exist since bash 4. With bash 3 the main loop
+# waits for keys in 1-second steps (key response is still immediate) and the
+# tail of escape sequences is read in non-blocking mode.
+declare -i FRAC=0
+TICK=1
+if (( BASH_VERSINFO[0] >= 4 )); then FRAC=1; TICK=0.1; fi
+# In bash 3.2 $'...' is not reliable inside "${var#...}": variables are used.
+TAB=$'\t'; NL=$'\n'
+
+# ---------------- STATE ----------------
+# NB: bash arrays are 0-based. SELECTED/OFFSET start from 0.
+ENGINE=""
+SORT="name"                        # sort key: name | cpu | mem
+declare -i SORT_REV=0              # 1 = reversed with respect to the natural order
+declare -i SHOW_ALL=0              # 0 = hide stopped containers (default); key a
+declare -i GROUP=1                 # 1 = group by compose project (default); key t
+FILTER=""                          # substring searched in name and project
+declare -i FILTER_EDIT=0           # 1 = the filter is being typed
+declare -i SELECTED=0 OFFSET=0 COUNT=0
+declare -i NTOTAL=0 NSHOWN=0       # existing / shown containers
+TOTAL_CPU=0 TOTAL_MEM=0            # float strings: handled by awk, NOT -i
+declare -a RAW=()                  # full snapshot, one line per container
+declare -a DATA=()                 # displayed rows (containers and group headers)
+declare -a KEYS=()                 # for each DATA row: container ID or "@G:project"
+declare -a GRP_NAMES=() GRP_N=() GRP_ACT=()   # per project: name, total containers, active ones
+declare -i R_IDX=-1
+declare -a GIDS=()
+declare -a PREV_FRAME=()           # lines of the last frame drawn (see draw)
+declare -i PREV_ROWS=0 PREV_COLS=0
+CUR_KEY=""                         # key of the selected row: the selection follows it
+REFRESH_PID="" SNAP="" LOG_PID="" LOG_FILTER_PID="" LOG_FIFO=""
+declare -i NEED_REDRAW=0
+declare -i CORES=1
+declare -i last_update=0 now=0 FAST_UNTIL=0
+declare -i ALT_SCREEN=0 HAS_LESS=0
+declare -i LOG_TAIL=1000
+MSG=""                             # outcome of the last action, shown for MSG_TTL seconds
+declare -i MSG_TS=0 MSG_TTL=5
+SEL_NAME="" SEL_ID="" SEL_STATE="" SEL_GROUP=""
+R_NUM="" R_STATE="" R_HEALTH="" R_PORTS="" R_UPTIME="" R_IMAGE="" R_FOOT=""
+STATS_OUT=""
+key="" seq=""
+
+# ---------------- COLOURS / SEQUENCES ----------------
+ESC=$'\033'
+RESET="${ESC}[0m";  BOLD="${ESC}[1m";  DIM="${ESC}[2m"
+FG_BLACK="${ESC}[30m"; FG_RED="${ESC}[31m"; FG_GREEN="${ESC}[32m"
+FG_YELLOW="${ESC}[33m"; FG_WHITE="${ESC}[97m"
+BG_GREEN="${ESC}[42m"; BG_CYAN="${ESC}[46m"; BG_RED="${ESC}[41m"
+HOME_="${ESC}[H"; CLR_EOL="${ESC}[K"; CLR_EOS="${ESC}[J"; CLR_ALL="${ESC}[2J"
+# Around every screen update: autowrap off (a line that is too long is clipped
+# instead of scrolling the screen) and "synchronized output" (mode 2026: the
+# terminal shows the update all at once; terminals that do not know it ignore
+# the sequence).
+FRAME_BEGIN="${ESC}[?2026h${ESC}[?7l"; FRAME_END="${ESC}[?7h${ESC}[?2026l"
+printf -v SPACES '%*s' 400 ''
+
+# Formats. 'ps -a' is the primary source (it includes stopped containers);
+# 'stats' provides the metrics for running containers only, joined by ID.
+# Separators are real TABs ($'\t'), so they do not depend on how the engine
+# interprets the "\t" sequence in the template. Fields that may be empty carry
+# a prefix (S: P: L:): TAB is whitespace for IFS and 'read' would merge two
+# consecutive separators, shifting the columns.
+# The compose project label is read with '.Label': if the engine rejects the
+# template, emit_snapshot falls back to the format without it (PS_LABEL=0).
+PS_LABEL=1
+ps_fmt() {
+  local f=$'{{.ID}}\t{{.Names}}\t{{.State}}\tS:{{.Status}}\t{{.Image}}\tP:{{.Ports}}'
+  (( PS_LABEL )) && f+=$'\tL:{{.Label "com.docker.compose.project"}}'
+  printf '%s' "$f"
+}
+# The PID field is called .PIDS in podman and .PIDs in docker: an unknown field
+# makes the whole command fail, so the name is a variable and fetch_stats
+# switches to the other one if the first is rejected.
+PIDS_FIELD="PIDS"
+stats_fmt() {
+  printf '%s' "{{.ID}}"$'\t'"{{.CPUPerc}}"$'\t'"{{.MemPerc}}"$'\t'"{{.MemUsage}}"$'\t'"{{.${PIDS_FIELD}}}"$'\t'"{{.NetIO}}"$'\t'"{{.BlockIO}}"
+}
+
+# ---------------- COLUMN DEFINITIONS (0-based) ----------------
+# Order = priority (from the left). Columns beyond MIN_COLS are shown only if
+# there is enough horizontal room. align: l=left, r=right.
+# The widths of NAME, PORTS and IMAGE adapt to the longest content, within
+# their respective minimum and maximum.
+declare -a COL_HDR=(NAME STATE HEALTH "CPU%" "MEM%" PORTS UPTIME "MEM USAGE" PIDS IMAGE "NET I/O" "BLOCK I/O")
+declare -a COL_W=(  18   10    9       7      7      12    7      20          5    16    18        18)
+declare -a COL_ALN=(l    l     l       r      r      l     r      l           r    l     l         l)
+declare -a COL_KEY=(name state health  cpu    mem    ports uptime memu        pids image net       blk)
+declare -i C_NAME=0 C_PORTS=5 C_IMAGE=9
+declare -i MIN_COLS=5 NAME_MIN=12 NAME_MAX=40 PORTS_MIN=5 PORTS_MAX=36 IMAGE_MIN=5 IMAGE_MAX=28
+
+# Footer entries, in priority order: (key label)... On narrow terminals only
+# the first ones that fit on the line are shown.
+declare -a FOOT_ITEMS=('?' Help q Quit / Filter l Log s Shell S Start/Stop r Restart
+                       x Kill d Del p Pause i Inspect L LogLess t Groups a Stopped c CPU m MEM n Name)
+
+# ---------------- UTILITIES ----------------
+# "12,34%" -> "12.34"; any non-numeric value (e.g. "-") -> "0".
+# Result in R_NUM (no subshell: it is called for every row).
+to_num() {
+  local v=${1%\%}; v=${v//,/.}; v=${v//[^0-9.]/}
+  [[ -z "$v" || "$v" == "." ]] && v=0
+  R_NUM=$v
+}
+
+# fit VAR WIDTH l|r TEXT — truncates or pads TEXT to WIDTH characters and
+# assigns it to VAR. It counts characters, not bytes (unlike printf '%-*s'),
+# so '→' and the like do not shift the columns.
+fit() {
+  local _fs=${4:0:$2} _fp
+  local -i _fn=$(( $2 - ${#_fs} ))
+  if (( _fn <= 0 )); then _fp=""
+  elif (( _fn <= ${#SPACES} )); then _fp=${SPACES:0:_fn}
+  else printf -v _fp '%*s' "$_fn" ''
+  fi
+  if [[ "$3" == r ]]; then printf -v "$1" '%s' "${_fp}${_fs}"; else printf -v "$1" '%s' "${_fs}${_fp}"; fi
+}
+
+# Number of CPUs available to the containers. It must be asked to the engine:
+# with Docker Desktop or podman machine the containers run in a VM whose CPU
+# count differs from the host's. nproc/getconf remain as a fallback.
+detect_cores() {
+  local n
+  n=$("$ENGINE" info --format '{{.NCPU}}' 2>/dev/null) || n=""
+  if ! [[ "$n" =~ ^[1-9][0-9]*$ ]]; then
+    n=$("$ENGINE" info --format '{{.Host.CPUs}}' 2>/dev/null) || n=""
+  fi
+  if ! [[ "$n" =~ ^[1-9][0-9]*$ ]]; then
+    n=$(nproc 2>/dev/null) \
+      || n=$(getconf _NPROCESSORS_ONLN 2>/dev/null) \
+      || n=1
+    n=${n//[^0-9]/}; [[ -z "$n" || "$n" == 0 ]] && n=1
+  fi
+  printf '%s' "$n"
+}
+
+# Clock in seconds without forking: only time differences are needed, so
+# SECONDS (seconds since the shell started), available in every bash, is enough.
+epoch() { printf -v "$1" '%s' "$SECONDS"; }
+
+# Index of project $1 in GRP_NAMES (R_IDX); false if it is not there.
+grp_find() {
+  local -i i
+  for (( i=0; i<${#GRP_NAMES[@]}; i++ )); do
+    if [[ "${GRP_NAMES[i]}" == "$1" ]]; then R_IDX=$i; return 0; fi
+  done
+  R_IDX=-1
+  return 1
+}
+
+# Reads into 'seq' the rest of an escape sequence after the ESC byte; 'seq'
+# stays empty if ESC was pressed on its own. With bash 3 the read is
+# non-blocking (term_raw sets 'min 0 time 0') and may return several queued
+# sequences, separated by ESC, when a key is held down.
+read_seq() {
+  seq=""
+  if (( FRAC )); then
+    IFS= read -rsn2 -t 0.02 seq
+    case "$seq" in '[5'|'[6') IFS= read -rsn1 -t 0.02 _ ;; esac
+  else
+    IFS= read -r seq
+  fi
+}
+
+set_msg() { MSG=$1; epoch MSG_TS; }
+
+# ---------------- TERMINAL ----------------
+# 'min 0 time 0': a 'read' without -n returns at once with the bytes already received.
+term_raw()     { tput civis 2>/dev/null; stty -echo -icanon time 0 min 0; }
+term_restore() { stty sane 2>/dev/null; tput cnorm 2>/dev/null; }
+
+full_cleanup() {
+  term_restore
+  [[ -n "$LOG_PID" ]] && kill "$LOG_PID" 2>/dev/null
+  [[ -n "$LOG_FILTER_PID" ]] && kill "$LOG_FILTER_PID" 2>/dev/null
+  [[ -n "$REFRESH_PID" ]] && kill "$REFRESH_PID" 2>/dev/null
+  [[ -n "$LOG_FIFO" ]] && rm -f "$LOG_FIFO" 2>/dev/null
+  [[ -n "$SNAP" ]] && rm -f "$SNAP" "${SNAP}.tmp" 2>/dev/null
+  # Alternate screen: on exit the terminal goes back to what it showed before.
+  if (( ALT_SCREEN )); then
+    tput rmcup 2>/dev/null
+  else
+    printf '%s' "${CLR_ALL}${HOME_}"
+  fi
+}
+
+# ---------------- ASYNCHRONOUS REFRESH ----------------
+# A background process periodically updates a snapshot in a temporary file
+# (created with mktemp -> random name, 0600 permissions). The swap is done
+# with 'mv' so that the main loop always reads it atomically.
+#
+# Snapshot: one TSV line per container, 14 fields:
+#   name id state health cpu mem memusage pids netio blockio ports image uptime project
+# No field is ever empty ('-' takes its place), for the same reason as the
+# prefixes in the 'ps' format. The project is always the LAST field.
+
+# Normalises the state to a single lowercase word. It covers both the docker
+# values ("running", "exited", ...) and the podman variants ("stopped", or a
+# Status-like string such as "Up 5 minutes"). Result in R_STATE.
+norm_state() {
+  local s=${1%% *}
+  case "$s" in
+    running|exited|created|paused|restarting|removing|dead|stopping) ;;   # the usual case
+    *)
+      shopt -s nocasematch
+      case "$s" in
+        up|running)                     s="running" ;;
+        stopped|exited)                 s="exited" ;;
+        configured|initialized|created) s="created" ;;
+        paused)                         s="paused" ;;
+        restarting)                     s="restarting" ;;
+        removing)                       s="removing" ;;
+        stopping)                       s="stopping" ;;
+        dead)                           s="dead" ;;
+        "")                             s="-" ;;
+      esac
+      shopt -u nocasematch ;;
+  esac
+  R_STATE=$s
+}
+
+is_active() { [[ "$1" == running || "$1" == restarting || "$1" == paused || "$1" == stopping ]]; }
+
+# Extracts the health state from the Status string of 'ps'
+# (docker: "Up 5 minutes (health: starting)", podman: "Up 5 minutes (starting)").
+# Without 'inspect' (expensive) this is the only source the ps command offers.
+# It only makes sense for running containers: for the others it stays '-'.
+# Result in R_HEALTH.
+parse_health() {
+  R_HEALTH="-"
+  [[ "$1" == running ]] || return 0
+  case "$2" in
+    *'(healthy)'*)                        R_HEALTH="healthy" ;;
+    *'(unhealthy)'*)                      R_HEALTH="unhealthy" ;;
+    *'(health: starting)'*|*'(starting)'*) R_HEALTH="starting" ;;
+  esac
+}
+
+# Uptime in compact form, from the Status string of 'ps':
+#   "Up 5 minutes (healthy)" -> "5m"   "Up About an hour" -> "1h"   "Up 3 days" -> "3d"
+# For inactive containers it stays '-'. Result in R_UPTIME.
+fmt_uptime() {
+  R_UPTIME="-"
+  local s=$1 n u
+  [[ "$s" == Up\ * ]] || return 0
+  s=${s#Up }; s=${s%% (*}
+  case "$s" in
+    "Less than a second") R_UPTIME="<1s"; return 0 ;;
+    "About a minute")     R_UPTIME="1m";  return 0 ;;
+    "About an hour")      R_UPTIME="1h";  return 0 ;;
+  esac
+  n=${s%% *}; u=${s#* }
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    case "$u" in
+      second*) R_UPTIME="${n}s" ;;
+      minute*) R_UPTIME="${n}m" ;;
+      hour*)   R_UPTIME="${n}h" ;;
+      day*)    R_UPTIME="${n}d" ;;
+      week*)   R_UPTIME="${n}w" ;;
+      month*)  R_UPTIME="${n}mo" ;;
+      year*)   R_UPTIME="${n}y" ;;
+      *)       R_UPTIME=${s// /} ;;
+    esac
+  else
+    R_UPTIME=${s// /}
+  fi
+  [[ -z "$R_UPTIME" ]] && R_UPTIME="-"
+  return 0
+}
+
+# Short image name: no digest and no registry/path.
+#   "quay.io/keycloak/keycloak:26.6.3" -> "keycloak:26.6.3"
+# Result in R_IMAGE.
+fmt_image() {
+  local i=$1
+  if [[ "$i" == sha256:* ]]; then
+    i=${i:7:12}
+  else
+    i=${i%@*}; i=${i##*/}
+  fi
+  [[ -z "$i" ]] && i="-"
+  R_IMAGE=$i
+}
+
+# Reduces the Ports field of 'ps' to the ports published on the host only, in
+# compact form. Input (docker and podman):
+#   "0.0.0.0:8443->8443/tcp, :::8443->8443/tcp, 127.0.0.1:8025->8025/tcp, 9000/tcp"
+# Output: "8443,127.0.0.1:8025"   ('9000/tcp' is only exposed, not published)
+# Rules: the address is omitted when it means "all interfaces"; "→port" only
+# if the container port differs; "/proto" only if it is not tcp; no duplicates
+# (IPv4 and IPv6 of the same publication). Result in R_PORTS.
+format_ports() {
+  R_PORTS="-"
+  [[ -z "$1" ]] && return 0
+  local -a entries=()
+  local e host cont proto cport hport hip label out=""
+  IFS=',' read -ra entries <<< "$1"
+  for e in "${entries[@]}"; do
+    e=${e// /}
+    [[ "$e" == *'->'* ]] || continue
+    host=${e%%->*}; cont=${e##*->}
+    proto="tcp"; [[ "$cont" == */* ]] && proto=${cont##*/}
+    cport=${cont%%/*}
+    if [[ "$host" == *:* ]]; then hport=${host##*:}; hip=${host%:*}; else hport=$host; hip=""; fi
+    case "$hip" in 0.0.0.0|::|'[::]'|:|'') hip="" ;; esac
+    label="${hip:+${hip}:}${hport}"
+    [[ "$hport" != "$cport" ]] && label+="→${cport}"
+    [[ "$proto" != tcp ]] && label+="/${proto}"
+    [[ ",${out}," == *",${label},"* ]] && continue
+    out+="${out:+,}${label}"
+  done
+  [[ -n "$out" ]] && R_PORTS=$out
+  return 0
+}
+
+# Reads the metrics into STATS_OUT. This is the slow part of the cycle (the
+# engine samples for about one second). Call it directly, not inside $(...):
+# STATS_OUT and PIDS_FIELD must stay in the refresher's shell.
+fetch_stats() {
+  if ! STATS_OUT=$("$ENGINE" stats --no-stream --format "$(stats_fmt)" 2>/dev/null); then
+    # Template rejected: try the other name of the PID field and, if it works,
+    # keep it for the following cycles.
+    local prev=$PIDS_FIELD
+    if [[ "$PIDS_FIELD" == PIDS ]]; then PIDS_FIELD="PIDs"; else PIDS_FIELD="PIDS"; fi
+    STATS_OUT=$("$ENGINE" stats --no-stream --format "$(stats_fmt)" 2>/dev/null) \
+      || { PIDS_FIELD=$prev; STATS_OUT=""; }
+  fi
+}
+
+# Writes the snapshot to stdout: the 'ps' list (fast, read right now) joined
+# with the latest metrics read by fetch_stats.
+emit_snapshot() {
+  local ps_out
+  if ! ps_out=$("$ENGINE" ps -a --format "$(ps_fmt)" 2>/dev/null); then
+    if (( PS_LABEL )); then
+      # The engine may not know '.Label': if it works without it, groups are
+      # given up for the following cycles.
+      PS_LABEL=0
+      ps_out=$("$ENGINE" ps -a --format "$(ps_fmt)" 2>/dev/null) || { PS_LABEL=1; ps_out=""; }
+    else
+      ps_out=""
+    fi
+  fi
+
+  # Metrics are looked up by ID in the 'stats' text (lines "id<TAB>cpu<TAB>..."),
+  # delimited by newlines: a single expansion per container, no maps.
+  local id tmp blob="${NL}${STATS_OUT}${NL}"
+
+  local name state cstatus image cports cproj stat cpu mem memu pids net blk
+  while IFS=$'\t' read -r id name state cstatus image cports cproj; do
+    [[ -z "$id" || -z "$name" ]] && continue
+    cstatus=${cstatus#S:}; cports=${cports#P:}; cproj=${cproj#L:}
+    norm_state "$state"
+    parse_health "$R_STATE" "$cstatus"
+    format_ports "$cports"
+    fmt_image "$image"
+    R_UPTIME="-"; is_active "$R_STATE" && fmt_uptime "$cstatus"
+    # The label is free text chosen by whoever creates the container: only
+    # harmless characters are kept, so it can alter neither the snapshot nor the terminal.
+    cproj=${cproj//[^A-Za-z0-9_.-]/_}; [[ -z "$cproj" ]] && cproj="-"
+    # Metrics only if the container is active: right after a stop STATS_OUT
+    # still holds the values of the last sampling.
+    stat=""
+    if is_active "$R_STATE"; then
+      tmp=${blob#*"${NL}${id}${TAB}"}
+      [[ "$tmp" != "$blob" ]] && stat=${tmp%%"${NL}"*}
+    fi
+    if [[ -n "$stat" ]]; then
+      IFS=$'\t' read -r cpu mem memu pids net blk <<< "$stat"
+    else
+      cpu="-"; mem="-"; memu="-"; pids="-"; net="-"; blk="-"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$name" "$id" "$R_STATE" "$R_HEALTH" "${cpu:--}" "${mem:--}" "${memu:--}" "${pids:--}" \
+      "${net:--}" "${blk:--}" "$R_PORTS" "$R_IMAGE" "$R_UPTIME" "$cproj"
+  done <<< "$ps_out"
+}
+
+write_snapshot() {
+  emit_snapshot > "${SNAP}.tmp" 2>/dev/null
+  mv -f "${SNAP}.tmp" "$SNAP" 2>/dev/null
+}
+
+start_refresher() {
+  # $XDG_RUNTIME_DIR is a private per-user tmpfs (0700): preferred over /tmp.
+  local dir=${XDG_RUNTIME_DIR:-}
+  [[ -n "$dir" && -d "$dir" && -w "$dir" ]] || dir=${TMPDIR:-/tmp}
+  SNAP=$(mktemp "${dir%/}/${SELF}.XXXXXX") \
+    || { printf '%s\n' "mktemp failed" >&2; exit 1; }
+  {
+    # SIGUSR1 (sent by refresh_now after an action) asks for an immediate
+    # snapshot: it interrupts the wait and writes the updated list right away
+    # with the previous metrics, without waiting for the 'stats' sampling.
+    # It starts with force=1: the list shows up at once, the metrics shortly after.
+    force=1
+    trap 'force=1' USR1
+    while :; do
+      if (( force )); then
+        force=0
+        write_snapshot
+      fi
+      fetch_stats
+      write_snapshot
+      (( force )) && continue
+      sleep 1 &
+      wait $! 2>/dev/null
+    done
+  } &
+  REFRESH_PID=$!
+}
+
+# Asks the refresher for an immediate snapshot and, for a few seconds, makes
+# the main loop re-read the snapshot at every iteration instead of once per
+# second: the effect of an action shows up as soon as the engine reports it.
+refresh_now() {
+  [[ -n "$REFRESH_PID" ]] && kill -USR1 "$REFRESH_PID" 2>/dev/null
+  epoch now
+  FAST_UNTIL=$(( now + 3 ))
+}
+
+# ---------------- DATA ----------------
+update_stats() {
+  local -a keyed=() sorted=()
+  local line name id state health cpu mem memu pids net blk ports image uptime proj
+  local key gkey rest prev
+  local -i maxname=0 maxports=0 maximage=0 i found=0 nomatch=0
+  RAW=()
+  if [[ -s "$SNAP" ]]; then
+    while IFS= read -r line; do RAW+=("$line"); done < "$SNAP"
+  fi
+
+  GRP_NAMES=(); GRP_N=(); GRP_ACT=(); NTOTAL=0
+  for line in "${RAW[@]}"; do
+    [[ -z "$line" ]] && continue
+    IFS=$'\t' read -r name id state health cpu mem memu pids net blk ports image uptime proj <<< "$line"
+    [[ -z "$name" || -z "$proj" ]] && continue
+    NTOTAL+=1
+    if ! grp_find "$proj"; then
+      GRP_NAMES+=("$proj"); GRP_N+=(0); GRP_ACT+=(0)
+      R_IDX=$(( ${#GRP_NAMES[@]} - 1 ))
+    fi
+    GRP_N[R_IDX]=$(( GRP_N[R_IDX] + 1 ))
+    if is_active "$state"; then
+      GRP_ACT[R_IDX]=$(( GRP_ACT[R_IDX] + 1 ))
+    elif (( ! SHOW_ALL )); then
+      continue
+    fi
+    if [[ -n "$FILTER" ]]; then
+      # case-insensitive comparison
+      shopt -s nocasematch
+      [[ "$name" == *"$FILTER"* || "$proj" == *"$FILTER"* ]]; nomatch=$?
+      shopt -u nocasematch
+      (( nomatch )) && continue
+    fi
+    (( ${#name} > maxname )) && maxname=${#name}
+    (( ${#ports} > maxports )) && maxports=${#ports}
+    (( ${#image} > maximage )) && maximage=${#image}
+    case "$SORT" in
+      cpu)  to_num "$cpu"; key=$R_NUM ;;
+      mem)  to_num "$mem"; key=$R_NUM ;;
+      *)    key=$name ;;
+    esac
+    # With groups on, the project is the first key; containers without a
+    # project ("1") come after all the others ("0name").
+    gkey="0"
+    if (( GROUP )); then
+      if [[ "$proj" == "-" ]]; then gkey="1"; else gkey="0${proj}"; fi
+    fi
+    keyed+=("${gkey}"$'\t'"${key}"$'\t'"${line}")
+  done
+
+  # totals (sum of CPU% and MEM% over ALL containers, including those hidden
+  # by the filter) via awk: bash has no floating point.
+  TOTAL_CPU=0; TOTAL_MEM=0
+  if (( ${#RAW[@]} > 0 )); then
+    read -r TOTAL_CPU TOTAL_MEM < <(
+      printf '%s\n' "${RAW[@]}" | awk -F'\t' '
+        { c=$5; m=$6; gsub(/,/,".",c); gsub(/,/,".",m)
+          gsub(/[^0-9.]/,"",c); gsub(/[^0-9.]/,"",m); C+=c+0; M+=m+0 }
+        END { printf "%.4f %.4f", C+0, M+0 }'
+    )
+  fi
+
+  if (( ${#keyed[@]} == 0 )); then
+    DATA=(); KEYS=(); COUNT=0; NSHOWN=0; SELECTED=0; OFFSET=0
+    return
+  fi
+
+  # width of the NAME, PORTS and IMAGE columns from the longest content
+  (( GROUP )) && maxname+=2                       # indentation under the group
+  (( maxname < NAME_MIN )) && maxname=NAME_MIN
+  (( maxname > NAME_MAX )) && maxname=NAME_MAX
+  COL_W[C_NAME]=$maxname
+  (( maxports < PORTS_MIN )) && maxports=PORTS_MIN
+  (( maxports > PORTS_MAX )) && maxports=PORTS_MAX
+  COL_W[C_PORTS]=$maxports
+  (( maximage < IMAGE_MIN )) && maximage=IMAGE_MIN
+  (( maximage > IMAGE_MAX )) && maximage=IMAGE_MAX
+  COL_W[C_IMAGE]=$maximage
+
+  # Fields of the keyed line: 1=group 2=key 3=name. Natural order: ascending
+  # alphabetical by name, descending numeric by CPU/MEM; SORT_REV reverses it.
+  # Ties are sorted by name: rows whose metric is 0 or '-' stay put instead of
+  # swapping at every refresh.
+  local -a sort_opts=(-t$'\t' -k1,1)
+  if [[ "$SORT" == "name" ]]; then
+    if (( SORT_REV )); then sort_opts+=(-k2,2fr); else sort_opts+=(-k2,2f); fi
+  else
+    if (( SORT_REV )); then sort_opts+=(-k2,2n -k3,3f); else sort_opts+=(-k2,2nr -k3,3f); fi
+  fi
+  while IFS= read -r line; do
+    sorted+=("$line")
+  done < <(printf '%s\n' "${keyed[@]}" | sort "${sort_opts[@]}" | cut -f3-)
+
+  # Rows to display: with groups on, every project is preceded by a header
+  # row "@G <project> <total> <active>".
+  DATA=(); KEYS=(); prev=$'\001'
+  for line in "${sorted[@]}"; do
+    [[ -z "$line" ]] && continue
+    if (( GROUP )); then
+      proj=${line##*"$TAB"}
+      if [[ "$proj" != "$prev" ]]; then
+        grp_find "$proj"
+        DATA+=("@G${TAB}${proj}${TAB}${GRP_N[R_IDX]:-0}${TAB}${GRP_ACT[R_IDX]:-0}")
+        KEYS+=("@G:${proj}")
+        prev=$proj
+      fi
+    fi
+    rest=${line#*"$TAB"}
+    DATA+=("$line"); KEYS+=("${rest%%"$TAB"*}")
+  done
+  COUNT=${#DATA[@]}
+  NSHOWN=${#sorted[@]}
+
+  # The selection follows the container (or the group), not the position:
+  # after a re-sort the cursor stays on the same logical row.
+  if [[ -n "$CUR_KEY" ]]; then
+    for (( i=0; i<COUNT; i++ )); do
+      if [[ "${KEYS[i]}" == "$CUR_KEY" ]]; then SELECTED=$i; found=1; break; fi
+    done
+  fi
+  (( SELECTED < 0 )) && SELECTED=0
+  (( SELECTED > COUNT - 1 )) && SELECTED=$(( COUNT - 1 ))
+  (( found )) || CUR_KEY=${KEYS[SELECTED]:-}
+}
+
+# ---------------- UI COMPONENTS ----------------
+# htop-style bar: LABEL[||||||||          12.3%]
+draw_meter() {
+  local label=$1 pct=$2 width=$3
+  # $pct comes from awk already in the "12.3" form: no conversion in bash.
+  local pf=$pct
+  [[ "$pf" =~ ^[0-9]+\.[0-9]$ ]] || pf="0.0"
+  local p=${pf%%.*}; p=${p//[^0-9]/}; [[ -z "$p" ]] && p=0
+  (( p > 100 )) && p=100; (( p < 0 )) && p=0
+  local pctlabel="${pf}%"
+  local llen=${#pctlabel}
+  local field=$(( width - llen - 1 )); (( field < 1 )) && field=1
+  local filled=$(( field * p / 100 )); (( filled > field )) && filled=field
+  local empty=$(( field - filled ))
+  local color=$FG_GREEN
+  (( p >= 50 )) && color=$FG_YELLOW
+  (( p >= 80 )) && color=$FG_RED
+  local bar="" sp="" i
+  for (( i=0; i<filled; i++ )); do bar+="|"; done
+  for (( i=0; i<empty;  i++ )); do sp+=" "; done
+  printf '%s' "${BOLD}${label}${RESET}${DIM}[${RESET}${color}${bar}${RESET}${sp} ${BOLD}${pctlabel}${RESET}${DIM}]${RESET}"
+}
+
+# Footer in R_FOOT, at most $1 columns wide. While the filter is being typed
+# it shows the input field.
+footer() {
+  local -i cols=$1 used=0 need i
+  local k l
+  R_FOOT=""
+  if (( FILTER_EDIT )); then
+    need=$(( cols - 38 )); (( need < 1 )) && need=1
+    R_FOOT="${BOLD} Filter: ${RESET}${FILTER:0:need}${BG_CYAN} ${RESET}  ${DIM}Enter: apply   ESC: cancel${RESET}"
+    return
+  fi
+  for (( i=0; i<${#FOOT_ITEMS[@]}; i+=2 )); do
+    k=${FOOT_ITEMS[i]}; l=${FOOT_ITEMS[i+1]}
+    need=$(( ${#k} + ${#l} + 3 ))
+    (( used + need > cols - 1 )) && break
+    R_FOOT+="${BOLD}${FG_WHITE}${k}${RESET}${BG_CYAN}${FG_BLACK} ${l} ${RESET} "
+    used+=need
+  done
+}
+
+draw() {
+  local rows cols
+  rows=$(tput lines); cols=$(tput cols)
+  (( cols < 40 )) && cols=40
+  local visible=$(( rows - 5 ))
+  (( visible < 1 )) && visible=1
+
+  # constraints on the selection and on the scroll window
+  if (( COUNT > 0 )); then
+    (( SELECTED < 0 )) && SELECTED=0
+    (( SELECTED > COUNT - 1 )) && SELECTED=$(( COUNT - 1 ))
+    (( SELECTED < OFFSET )) && OFFSET=$SELECTED
+    (( SELECTED > OFFSET + visible - 1 )) && OFFSET=$(( SELECTED - visible + 1 ))
+    (( OFFSET < 0 )) && OFFSET=0
+  else
+    OFFSET=0
+  fi
+
+  # The screen is composed in L, one entry per line; at the end only the lines
+  # that differ from those already on screen (PREV_FRAME) are written.
+  # Full-width lines carry no CLR_EOL: past the last column it would erase the
+  # last character.
+  local -a L=()
+
+  # --- CPU / MEM meters ---
+  local meter_w=$(( cols - 6 ))
+  local cpu_pct mem_pct
+  cpu_pct=$(LC_ALL=C awk -v a="$TOTAL_CPU" -v b="$CORES" 'BEGIN{ if(b<1)b=1; printf "%.1f", a/b }')
+  mem_pct=$(LC_ALL=C awk -v m="$TOTAL_MEM" 'BEGIN{ if(m>100)m=100; printf "%.1f", m }')
+  L+=("$(draw_meter 'CPU ' "$cpu_pct" "$meter_w")")
+  L+=("$(draw_meter 'MEM ' "$mem_pct" "$meter_w")")
+
+  # Sort direction: ▲ ascending, ▼ descending.
+  local arrow
+  if [[ "$SORT" == "name" ]]; then
+    if (( SORT_REV )); then arrow="▼"; else arrow="▲"; fi
+  else
+    if (( SORT_REV )); then arrow="▲"; else arrow="▼"; fi
+  fi
+
+  # --- status line (or outcome of the last action, for MSG_TTL seconds) ---
+  if [[ -n "$MSG" ]] && (( now - MSG_TS < MSG_TTL )); then
+    L+=("${FG_YELLOW}${BOLD} ${MSG:0:cols-2}${RESET}${CLR_EOL}")
+  else
+    MSG=""
+    local sortlabel="NAME" statusline shown=$NSHOWN
+    case "$SORT" in
+      cpu)  sortlabel="CPU" ;;
+      mem)  sortlabel="MEM" ;;
+    esac
+    (( NSHOWN != NTOTAL )) && shown="${NSHOWN}/${NTOTAL}"
+    statusline=" ${ENGINE}   Containers: ${shown}   Sort: ${sortlabel} ${arrow}   Cores: ${CORES}"
+    [[ -n "$FILTER" ]] && statusline+="   Filter: ${FILTER}"
+    (( SHOW_ALL )) || statusline+="   [active only]"
+    (( GROUP )) && statusline+="   [groups]"
+    L+=("${DIM}${statusline:0:cols-1}${RESET}${CLR_EOL}")
+  fi
+
+  # --- column selection based on the width ---
+  # Shows the columns (in priority order) as long as they fit in the width.
+  # The first MIN_COLS are always shown (clipped if the terminal is too narrow).
+  local ncols=${#COL_KEY[@]}
+  local show=0 used=1 c need
+  for (( c=0; c<ncols; c++ )); do
+    need=$(( COL_W[c] + 1 ))
+    if (( c < MIN_COLS || used + need <= cols )); then
+      show=$(( c + 1 ))
+      used=$(( used + need ))
+    else
+      break
+    fi
+  done
+
+  # --- column headers (the sort column is highlighted) ---
+  local hdr=" " h w aln cell
+  local -i vis=1
+  for (( c=0; c<show; c++ )); do
+    h=${COL_HDR[c]}; w=${COL_W[c]}; aln=${COL_ALN[c]}
+    if [[ "${COL_KEY[c]}" == "$SORT" ]]; then
+      fit cell "$w" "$aln" "${h}${arrow}"
+      hdr+="${BG_CYAN}${cell}${BG_GREEN}"
+    else
+      fit cell "$w" "$aln" "$h"
+      hdr+="$cell"
+    fi
+    vis+=$w
+    if (( c < show - 1 )); then hdr+=" "; vis+=1; fi
+  done
+  if (( cols > vis )); then
+    printf -v cell '%*s' $(( cols - vis )) ''
+    hdr+="$cell"
+  fi
+  L+=("${BG_GREEN}${FG_BLACK}${BOLD}${hdr}${RESET}")
+
+  # --- rows: containers and group headers ---
+  local i idx line name id state health cpu mem memu pids net blk ports image uptime proj
+  local gname gn gact
+  local rowstr selstr key val col hv selected
+  for (( i=0; i<visible; i++ )); do
+    idx=$(( OFFSET + i ))
+    if (( COUNT == 0 || idx >= COUNT )); then
+      L+=("${CLR_EOL}")
+      continue
+    fi
+    line=${DATA[$idx]}
+    (( idx == SELECTED )) && selected=1 || selected=0
+
+    if [[ "$line" == "@G${TAB}"* ]]; then
+      IFS=$'\t' read -r _ gname gn gact <<< "$line"
+      [[ "$gname" == "-" ]] && gname="(no project)"
+      fit cell "$cols" l " ▾ ${gname}  (${gact}/${gn} active)"
+      if (( selected )); then
+        L+=("${BG_CYAN}${FG_BLACK}${BOLD}${cell}${RESET}")
+      else
+        L+=("${BOLD}${cell}${RESET}")
+      fi
+      continue
+    fi
+
+    IFS=$'\t' read -r name id state health cpu mem memu pids net blk ports image uptime proj <<< "$line"
+    (( GROUP )) && name="  ${name}"
+
+    rowstr=" "; selstr=" "
+    for (( c=0; c<show; c++ )); do
+      key=${COL_KEY[c]}; w=${COL_W[c]}; aln=${COL_ALN[c]}
+      case "$key" in
+        name)   val=$name ;;   state)  val=$state ;;  health) val=$health ;;
+        cpu)    val=$cpu ;;    mem)    val=$mem ;;    ports)  val=$ports ;;
+        uptime) val=$uptime ;; memu)   val=$memu ;;   pids)   val=$pids ;;
+        image)  val=$image ;;  net)    val=$net ;;    blk)    val=$blk ;;
+        *)      val="" ;;
+      esac
+      fit cell "$w" "$aln" "$val"
+
+      if (( selected )); then
+        selstr+="$cell"
+      else
+        # per-column colour (inline, no subshell in the hot path)
+        col=""
+        case "$key" in
+          cpu|mem)
+            hv=${val%%[.,]*}; hv=${hv//[^0-9]/}; [[ -z "$hv" ]] && hv=0
+            if   (( hv >= 80 )); then col=$FG_RED
+            elif (( hv >= 50 )); then col=$FG_YELLOW
+            else                      col=$FG_GREEN
+            fi ;;
+          state)
+            case "$state" in
+              running)                     col=$FG_GREEN ;;
+              restarting|created|stopping) col=$FG_YELLOW ;;
+              paused)                      col=$DIM ;;
+              exited|dead)                 col=$FG_RED ;;
+            esac ;;
+          health)
+            case "$health" in
+              healthy)   col=$FG_GREEN ;;
+              unhealthy) col=$FG_RED ;;
+              starting)  col=$FG_YELLOW ;;
+              *)         col=$DIM ;;
+            esac ;;
+          ports)
+            # ports are highlighted only if the container is running: on a
+            # stopped one they are configured but not open.
+            if [[ "$ports" == "-" || "$state" != running ]]; then col=$DIM; else col=$FG_YELLOW; fi ;;
+          memu|pids|net|blk|image|uptime) col=$DIM ;;
+        esac
+        if [[ -n "$col" ]]; then rowstr+="${col}${cell}${RESET}"; else rowstr+="$cell"; fi
+      fi
+      (( c < show - 1 )) && { rowstr+=" "; selstr+=" "; }
+    done
+
+    if (( selected )); then
+      fit selstr "$cols" l "$selstr"
+      L+=("${BG_CYAN}${FG_BLACK}${selstr}${RESET}")
+    else
+      L+=("${rowstr}${CLR_EOL}")
+    fi
+  done
+
+  # --- footer ---
+  footer "$cols"
+  L+=("${R_FOOT}${CLR_EOL}")
+
+  # --- write only the lines that changed ---
+  # Redrawing the whole screen at every iteration causes flicker: each line is
+  # placed with an absolute sequence and rewritten only if it differs from the
+  # one on screen. After a resize, or when the screen has been used by
+  # something else (PREV_FRAME cleared by invalidate), everything is rewritten.
+  if (( rows != PREV_ROWS || cols != PREV_COLS )); then
+    PREV_FRAME=(); PREV_ROWS=$rows; PREV_COLS=$cols
+  fi
+  local out=""
+  local -i y n=${#L[@]}
+  (( n > rows )) && n=rows
+  for (( y=0; y<n; y++ )); do
+    [[ "${L[y]}" == "${PREV_FRAME[y]:-}" ]] && continue
+    out+="${ESC}[$(( y + 1 ));1H${L[y]}"
+  done
+  PREV_FRAME=("${L[@]}")
+  [[ -n "$out" ]] && printf '%s' "${FRAME_BEGIN}${out}${FRAME_END}"
+}
+
+# The screen has been dirtied (confirmation, help, less, shell, resize): the
+# next draw must rewrite every line.
+invalidate() { PREV_FRAME=(); }
+
+show_help() {
+  local b=$BOLD r=$RESET
+  printf '%s' "${CLR_ALL}${HOME_}"
+  printf '%s\n' \
+    "${b} ${SELF} — keys${r}" \
+    "" \
+    "${b} Navigation${r}" \
+    "   ↑ ↓  k j        previous / next row" \
+    "   PgUp PgDn       page                  g G  Home End   top / bottom of the list" \
+    "" \
+    "${b} View${r}" \
+    "   c  m  n         sort by CPU / MEM / name; the same key again reverses the order" \
+    "   /               filter on name and project (Enter applies, ESC cancels or clears)" \
+    "   a               show / hide stopped containers" \
+    "   t               group by compose project" \
+    "" \
+    "${b} Container${r}" \
+    "   l               live logs (q or ESC to go back)" \
+    "   L               logs in less, to scroll and search (q to go back)" \
+    "   s               shell in the container    i   inspect" \
+    "   S               start / stop              p   pause / unpause" \
+    "   r               restart                   x   kill" \
+    "   d               remove (forced if active)" \
+    "" \
+    "${b} Group (project row, with groups on)${r}" \
+    "   S               start / stop all the containers of the project" \
+    "   r               restart all the containers of the project" \
+    "" \
+    "   ? h             this help                 q   quit" \
+    "" \
+    "${DIM} Initial sort key: KONTOP_SORT=name|cpu|mem variable${r}" \
+    "" \
+    "${DIM} Press any key to go back...${r}"
+  read -rsn1 _
+  read_seq                      # tail of a possible escape sequence (arrow keys)
+  NEED_REDRAW=1
+}
+
+# ---------------- SELECTION ----------------
+# Loads the selected row: for a container SEL_NAME / SEL_ID / SEL_STATE
+# (SEL_GROUP empty); for a group header SEL_GROUP = project.
+load_selected() {
+  local -a f
+  IFS=$'\t' read -ra f <<< "${DATA[$SELECTED]}"
+  if [[ "${f[0]}" == "@G" ]]; then
+    SEL_GROUP=${f[1]}; SEL_NAME=${f[1]}; SEL_ID=""; SEL_STATE=""
+  else
+    SEL_GROUP=""; SEL_NAME=${f[0]}; SEL_ID=${f[1]}; SEL_STATE=${f[2]}
+  fi
+}
+
+# True if the selected row is a container; otherwise it warns that action $1
+# does not apply to a group.
+sel_container() {
+  (( COUNT == 0 )) && return 1
+  load_selected
+  [[ -z "$SEL_GROUP" ]] && return 0
+  set_msg "$1: select a container, not a group"
+  NEED_REDRAW=1
+  return 1
+}
+
+# IDs of the containers of project $1 into GIDS. $2: active | inactive | all.
+# It starts from the full snapshot: the filter and 'active only' do not apply.
+group_ids() {
+  local line name id state rest
+  GIDS=()
+  for line in "${RAW[@]}"; do
+    [[ -z "$line" || "${line##*"$TAB"}" != "$1" ]] && continue
+    IFS=$'\t' read -r name id state rest <<< "$line"
+    case "$2" in
+      active)   is_active "$state" || continue ;;
+      inactive) is_active "$state" && continue ;;
+    esac
+    GIDS+=("$id")
+  done
+}
+
+move() {
+  (( SELECTED += $1 ))
+  (( SELECTED < 0 )) && SELECTED=0
+  if (( COUNT > 0 )); then
+    (( SELECTED > COUNT - 1 )) && SELECTED=$(( COUNT - 1 ))
+  else
+    SELECTED=0
+  fi
+  CUR_KEY=${KEYS[SELECTED]:-}
+}
+
+move_to() {
+  SELECTED=$1
+  move 0
+}
+
+# Sorting: a different key changes the sort key, the same key reverses the direction.
+set_sort() {
+  if [[ "$SORT" == "$1" ]]; then
+    SORT_REV=$(( ! SORT_REV ))
+  else
+    SORT=$1; SORT_REV=0
+  fi
+  update_stats; draw
+}
+
+confirm() {
+  local msg=$1 rows ans
+  rows=$(tput lines)
+  printf '%s' "${ESC}[${rows};1H${BG_RED}${FG_WHITE}${BOLD} ${msg} [y/N] ${RESET}${CLR_EOL}"
+  read -rsn1 ans
+  [[ "$ans" == [yY] ]]
+}
+
+# ---------------- ACTIONS ----------------
+# Runs an engine command and reports its outcome in the status line: an error
+# (permissions, container gone, ...) does not go unnoticed.
+#   $1 = description for the message, the rest = arguments for the engine
+engine_action() {
+  local what=$1 err rows; shift
+  rows=$(tput lines)
+  printf '%s' "${ESC}[${rows};1H${BG_CYAN}${FG_BLACK} ${what}: in progress… ${RESET}${CLR_EOL}"
+  if err=$("$ENGINE" "$@" 2>&1 >/dev/null); then
+    set_msg "${what}: ok"
+  else
+    err=${err##*"$NL"}                       # last line of the error
+    set_msg "${what}: FAILED — ${err:-unknown error}"
+  fi
+  refresh_now
+}
+
+action_kill() {
+  sel_container kill || return
+  if confirm "Kill '${SEL_NAME}'?"; then
+    engine_action "kill ${SEL_NAME}" kill "$SEL_ID"
+  fi
+  NEED_REDRAW=1
+}
+
+# Container removal (rm). On active containers 'rm' fails: in that case a
+# second confirmation is asked before forcing it (rm -f).
+action_remove() {
+  sel_container rm || return
+  if confirm "Permanently remove '${SEL_NAME}'?"; then
+    if is_active "$SEL_STATE"; then
+      if confirm "'${SEL_NAME}' is active: force removal (kill + rm)?"; then
+        engine_action "rm -f ${SEL_NAME}" rm -f "$SEL_ID"
+      fi
+    else
+      engine_action "rm ${SEL_NAME}" rm "$SEL_ID"
+    fi
+  fi
+  NEED_REDRAW=1
+}
+
+# Restarts the container or, on a group row, all the containers of the project.
+action_restart() {
+  (( COUNT == 0 )) && return
+  load_selected
+  NEED_REDRAW=1
+  if [[ -n "$SEL_GROUP" ]]; then
+    [[ "$SEL_GROUP" == "-" ]] && { set_msg "restart: these containers do not belong to a compose project"; return; }
+    group_ids "$SEL_GROUP" all
+    (( ${#GIDS[@]} == 0 )) && return
+    if confirm "Restart stack '${SEL_GROUP}' (${#GIDS[@]} containers)?"; then
+      engine_action "restart stack ${SEL_GROUP}" restart "${GIDS[@]}"
+    fi
+    return
+  fi
+  if confirm "Restart '${SEL_NAME}'?"; then
+    engine_action "restart ${SEL_NAME}" restart "$SEL_ID"
+  fi
+}
+
+# Start if the container is stopped, stop (graceful, not kill) if it is active.
+# On a group row: stops the active containers of the project if there are any,
+# otherwise starts them all.
+action_startstop() {
+  (( COUNT == 0 )) && return
+  load_selected
+  NEED_REDRAW=1
+  if [[ -n "$SEL_GROUP" ]]; then
+    [[ "$SEL_GROUP" == "-" ]] && { set_msg "start/stop: these containers do not belong to a compose project"; return; }
+    group_ids "$SEL_GROUP" active
+    if (( ${#GIDS[@]} > 0 )); then
+      if confirm "Stop stack '${SEL_GROUP}' (${#GIDS[@]} active containers)?"; then
+        engine_action "stop stack ${SEL_GROUP}" stop "${GIDS[@]}"
+      fi
+    else
+      group_ids "$SEL_GROUP" inactive
+      (( ${#GIDS[@]} == 0 )) && return
+      if confirm "Start stack '${SEL_GROUP}' (${#GIDS[@]} containers)?"; then
+        engine_action "start stack ${SEL_GROUP}" start "${GIDS[@]}"
+      fi
+    fi
+    return
+  fi
+  if is_active "$SEL_STATE"; then
+    if confirm "Stop '${SEL_NAME}'?"; then
+      engine_action "stop ${SEL_NAME}" stop "$SEL_ID"
+    fi
+  else
+    if confirm "Start '${SEL_NAME}'?"; then
+      engine_action "start ${SEL_NAME}" start "$SEL_ID"
+    fi
+  fi
+}
+
+# Pauses a running container, unpauses a paused one.
+action_pause() {
+  sel_container pause || return
+  case "$SEL_STATE" in
+    paused)
+      if confirm "Unpause '${SEL_NAME}'?"; then
+        engine_action "unpause ${SEL_NAME}" unpause "$SEL_ID"
+      fi ;;
+    running)
+      if confirm "Pause '${SEL_NAME}'?"; then
+        engine_action "pause ${SEL_NAME}" pause "$SEL_ID"
+      fi ;;
+    *)
+      set_msg "pause ${SEL_NAME}: the container is not running (${SEL_STATE})" ;;
+  esac
+  NEED_REDRAW=1
+}
+
+# Filter for the logs shown live. Logs must never be written raw to the
+# terminal: an escape sequence inside them could alter it (title, cursor,
+# reprogrammed keys: CWE-150). Only colours (ESC[...m) are kept; every other
+# ESC and control character, UTF-8 encoded C1 included, is removed.
+# Steps: drop byte 0x01; colours are marked by replacing ESC with 0x01; drop
+# all the remaining control characters; 0x01 becomes ESC again.
+# sed must write line by line: -u with GNU sed, -l with the BSD/macOS one.
+SED_UNBUF=""
+log_filter() {
+  LC_ALL=C sed $SED_UNBUF \
+    -e $'s/\001//g' \
+    -e $'s/\033\\(\\[[0-9;]*m\\)/\001\\1/g' \
+    -e $'s/[\002-\010\013-\037\177]//g' \
+    -e $'s/\302[\200-\237]//g' \
+    -e $'s/\001/\033/g'
+}
+
+# Live logs (follow): q or ESC goes back to the monitor. The engine writes to a
+# private FIFO, read by log_filter which prints to the terminal: this way the
+# two processes shut down in order and nothing is left on disk.
+action_logs() {
+  sel_container log || return
+  NEED_REDRAW=1
+  LOG_FIFO="${SNAP}.log"
+  rm -f "$LOG_FIFO"
+  if ! mkfifo -m 600 "$LOG_FIFO" 2>/dev/null; then
+    LOG_FIFO=""
+    set_msg "log ${SEL_NAME}: cannot create the temporary FIFO"
+    return
+  fi
+
+  printf '%s' "${CLR_ALL}${HOME_}"
+  printf '%s\n' "${BOLD}Logs of ${SEL_NAME} (${SEL_ID}) — live follow${RESET}"
+  printf '%s\n' "${DIM}q or ESC: back to the monitor   (L from the monitor: logs in less, to scroll and search)${RESET}"
+  printf '%s\n' "------------------------------------------------------------"
+
+  log_filter < "$LOG_FIFO" &
+  LOG_FILTER_PID=$!
+  "$ENGINE" logs -f --tail 200 "$SEL_ID" > "$LOG_FIFO" 2>&1 < /dev/null &
+  LOG_PID=$!
+
+  local k
+  while :; do
+    # if the stream has ended (container stopped or removed), wait for a key
+    if ! kill -0 "$LOG_PID" 2>/dev/null; then
+      wait "$LOG_FILTER_PID" 2>/dev/null
+      printf '\n%s\n' "------------------------------------------------------------"
+      printf '%s' "${DIM}Stream ended. Press any key to go back...${RESET}"
+      read -rsn1 k
+      read_seq
+      break
+    fi
+    if IFS= read -rsn1 -t "$TICK" k; then
+      case "$k" in
+        q) break ;;
+        $'\033')
+          # lone ESC => go back; ESC followed by other bytes => a sequence, ignore it
+          read_seq
+          [[ -z "$seq" ]] && break
+          ;;
+      esac
+    fi
+  done
+
+  # Once the engine is closed, the filter sees the end of the FIFO and exits
+  # by itself: waiting for it keeps it from writing after the monitor is redrawn.
+  kill "$LOG_PID" 2>/dev/null
+  wait "$LOG_PID" 2>/dev/null
+  wait "$LOG_FILTER_PID" 2>/dev/null
+  LOG_PID=""; LOG_FILTER_PID=""
+  rm -f "$LOG_FIFO"; LOG_FIFO=""
+}
+
+# Logs in less, to scroll and search the last LOG_TAIL lines: it does not
+# follow new messages and closes with q. less -R lets only colours through and
+# shows the other escape sequences in visible form.
+action_logs_less() {
+  sel_container log || return
+  NEED_REDRAW=1
+  if (( ! HAS_LESS )); then
+    set_msg "logs in less: 'less' not found (use l for live logs)"
+    return
+  fi
+  term_restore
+  printf '%s' "${CLR_ALL}${HOME_}"
+  trap ':' INT                    # Ctrl-C is for less: the script must not exit
+  "$ENGINE" logs --tail "$LOG_TAIL" "$SEL_ID" 2>&1 < /dev/null | less -R +G
+  trap 'exit 130' INT
+  term_raw
+}
+
+# Container inspect, in less if available. The output goes through a pipe and
+# is not saved; it may contain the container's environment variables.
+action_inspect() {
+  sel_container inspect || return
+  term_restore
+  printf '%s' "${CLR_ALL}${HOME_}"
+  if (( HAS_LESS )); then
+    trap ':' INT
+    "$ENGINE" inspect "$SEL_ID" 2>&1 | less
+    trap 'exit 130' INT
+  else
+    "$ENGINE" inspect "$SEL_ID" 2>&1
+    printf '%s' "${DIM}Press any key to go back...${RESET}"
+    read -rsn1 _
+  fi
+  term_raw; NEED_REDRAW=1
+}
+
+# Shell in the container: bash if present, otherwise sh. The choice is made
+# INSIDE the container with a single exec, so leaving the shell with a non-zero
+# exit code does not open a second one (as 'exec sh || exec bash' would).
+action_shell() {
+  sel_container shell || return
+  if [[ "$SEL_STATE" != running ]]; then
+    set_msg "shell ${SEL_NAME}: the container is not running (${SEL_STATE})"
+    NEED_REDRAW=1
+    return
+  fi
+  # Preliminary check: minimal (distroless) images have no shell.
+  if ! "$ENGINE" exec "$SEL_ID" sh -c 'exit 0' >/dev/null 2>&1; then
+    set_msg "shell ${SEL_NAME}: no shell available in the container"
+    NEED_REDRAW=1
+    return
+  fi
+  term_restore; printf '%s' "${CLR_ALL}${HOME_}"
+  "$ENGINE" exec -it "$SEL_ID" sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'
+  term_raw; NEED_REDRAW=1
+}
+
+# ---------------- PREREQUISITES ----------------
+# Name the script was launched with, without path or extension, reduced to
+# safe characters (it ends up in the temporary file name).
+SELF=${0##*/}; SELF=${SELF%.sh}; SELF=${SELF//[^A-Za-z0-9_-]/}
+[[ -z "$SELF" ]] && SELF="kontop"
+
+# Initial sort key from the environment.
+sort_env=${KONTOP_SORT:-}
+shopt -s nocasematch
+case "$sort_env" in
+  "")   ;;
+  name) SORT="name" ;;
+  cpu)  SORT="cpu" ;;
+  mem)  SORT="mem" ;;
+  *) printf '%s\n' "Error: invalid KONTOP_SORT='${sort_env}' (allowed values: name, cpu, mem)." >&2; exit 1 ;;
+esac
+shopt -u nocasematch
+
+ENGINE=${CONTAINER_ENGINE:-}
+if [[ -z "$ENGINE" ]]; then
+  # Preference order: docker first, unless the launch name starts with 'p'
+  # (e.g. a symbolic link called ptop), which prefers podman.
+  case "$SELF" in
+    p*) engine_pref=(podman docker) ;;
+    *)  engine_pref=(docker podman) ;;
+  esac
+  for e in "${engine_pref[@]}"; do
+    if command -v "$e" >/dev/null 2>&1; then ENGINE=$e; break; fi
+  done
+  [[ -n "$ENGINE" ]] || { printf '%s\n' "Error: neither 'podman' nor 'docker' found in PATH." >&2; exit 1; }
+fi
+command -v "$ENGINE" >/dev/null 2>&1 || { printf '%s\n' "Error: '${ENGINE}' not found in PATH." >&2; exit 1; }
+command -v tput >/dev/null 2>&1 || { printf '%s\n' "Error: 'tput' not found (ncurses package)." >&2; exit 1; }
+command -v awk  >/dev/null 2>&1 || { printf '%s\n' "Error: 'awk' not found." >&2; exit 1; }
+[[ -t 0 && -t 1 ]] || { printf '%s\n' "Error: an interactive terminal is required." >&2; exit 1; }
+command -v less >/dev/null 2>&1 && HAS_LESS=1
+command -v sed  >/dev/null 2>&1 || { printf '%s\n' "Error: 'sed' not found." >&2; exit 1; }
+command -v mkfifo >/dev/null 2>&1 || { printf '%s\n' "Error: 'mkfifo' not found." >&2; exit 1; }
+if printf '' | sed -u -e '' >/dev/null 2>&1; then SED_UNBUF="-u"
+elif printf '' | sed -l -e '' >/dev/null 2>&1; then SED_UNBUF="-l"
+fi
+
+# The engine must answer BEFORE entering the interface: otherwise only an
+# empty list would show up, with no clue why.
+if ! engine_err=$("$ENGINE" ps -q 2>&1 >/dev/null); then
+  printf '%s\n' "Error: '${ENGINE} ps' is not responding: ${engine_err##*"$NL"}" >&2
+  exit 1
+fi
+[[ "$ENGINE" == *docker* ]] && PIDS_FIELD="PIDs"
+
+CORES=$(detect_cores)
+
+trap full_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'NEED_REDRAW=1' WINCH
+
+tput smcup 2>/dev/null && ALT_SCREEN=1
+term_raw
+start_refresher
+
+# Waits (at most ~1 s) for the first snapshot, so the list is already filled
+# at the first draw even with bash 3, where the loop wakes up once per second.
+for (( w=0; w<20; w++ )); do
+  [[ -s "$SNAP" ]] && break
+  sleep 0.05
+done
+
+# ---------------- MAIN LOOP ----------------
+while true; do
+  epoch now
+  # After an action (FAST_UNTIL) the snapshot is re-read at every iteration.
+  if (( now - last_update >= 1 || NEED_REDRAW || now <= FAST_UNTIL )); then
+    (( NEED_REDRAW )) && invalidate
+    update_stats
+    draw
+    last_update=$now
+    NEED_REDRAW=0
+  fi
+
+  # Empty IFS: this keeps a space distinguishable from Enter (empty key).
+  IFS= read -rsn1 -t "$TICK" key || continue
+
+  # Escape sequences (arrows, page keys) and a lone ESC: valid in every mode.
+  if [[ "$key" == $'\033' ]]; then
+    read_seq
+    if [[ -z "$seq" ]]; then
+      # lone ESC: cancel typing and clear the filter
+      if (( FILTER_EDIT )) || [[ -n "$FILTER" ]]; then
+        FILTER=""; FILTER_EDIT=0
+        update_stats; draw
+      fi
+      continue
+    fi
+    # one or more queued sequences (key held down), separated by ESC
+    while :; do
+      case "${seq%%"$ESC"*}" in
+        '[A'*)       move -1 ;;
+        '[B'*)       move 1 ;;
+        '[5'*)       move -10 ;;                  # PgUp
+        '[6'*)       move 10 ;;                   # PgDn
+        '[H'*|'OH'*) move_to 0 ;;
+        '[F'*|'OF'*) move_to $(( COUNT - 1 )) ;;
+      esac
+      [[ "$seq" == *"$ESC"* ]] || break
+      seq=${seq#*"$ESC"}
+    done
+    draw
+    continue
+  fi
+
+  # Typing the filter: every key edits the text and the list is updated.
+  if (( FILTER_EDIT )); then
+    case "$key" in
+      '')            FILTER_EDIT=0; draw ;;                       # Enter
+      $'\177'|$'\b') FILTER=${FILTER%?}; update_stats; draw ;;
+      [[:print:]])   (( ${#FILTER} < 40 )) && FILTER+=$key; update_stats; draw ;;
+    esac
+    continue
+  fi
+
+  case "$key" in
+    q) break ;;
+    j) move 1;  draw ;;
+    k) move -1; draw ;;
+    g) move_to 0; draw ;;
+    G) move_to $(( COUNT - 1 )); draw ;;
+    c) set_sort cpu ;;
+    m) set_sort mem ;;
+    n) set_sort name ;;
+    /) FILTER_EDIT=1; draw ;;
+    a) SHOW_ALL=$(( ! SHOW_ALL )); update_stats; draw ;;
+    t) GROUP=$(( ! GROUP )); update_stats; draw ;;
+    '?'|h) show_help ;;
+    l) action_logs ;;
+    L) action_logs_less ;;
+    s) action_shell ;;
+    i) action_inspect ;;
+    S) action_startstop ;;
+    p) action_pause ;;
+    x) action_kill ;;
+    d) action_remove ;;
+    r) action_restart ;;
+  esac
+done
+
+exit 0
