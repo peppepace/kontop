@@ -144,6 +144,13 @@ The first five are always shown; the others appear as the terminal gets wider.
 - **bash 3.2.** The screen is refreshed once per second instead of ten times
   per second, and the filter accepts ASCII characters only.
 
+## Disclaimer
+
+kontop is provided "as is", without warranty of any kind. It can stop, kill
+and remove containers, so use it at your own risk: the author accepts no
+responsibility for any damage, data loss or other problem caused by its use.
+See the [license](LICENSE) for the full terms.
+
 ## Credits
 
 Written by Giuseppe Pace, with the assistance of
